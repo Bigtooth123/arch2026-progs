@@ -87,7 +87,7 @@ ok "'*' lowers to a __mulsi3 call, no M instruction"
 
 "${PREFIX}gcc" $ARCH -ffreestanding -O2 -c -o "$tmp/probe.o" "$tmp/probe.c" &&
 "${PREFIX}as" $ARCH -o "$tmp/boot.o" "$tmp/boot.S" &&
-"${PREFIX}ld" -T "$tmp/l.ld" --no-warn-rwx-segments -o "$tmp/probe.elf" "$tmp/boot.o" 2> "$tmp/err" ||
+"${PREFIX}ld" -m elf32lriscv -T "$tmp/l.ld" --no-warn-rwx-segments -o "$tmp/probe.elf" "$tmp/boot.o" 2> "$tmp/err" ||
   fail "Compile, assemble or link of the probe failed" "$(head -3 "$tmp/err")"
 ok "compile, assemble and link"
 
