@@ -1,0 +1,199 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum {
+    PERMUTATIONS = 5040,
+    ORIENTATIONS = 729,
+    STATES = PERMUTATIONS * ORIENTATIONS,
+    MOVES = 9,
+    NEAR_COUNT = 12224,
+    FAR_COUNT = 2644
+};
+
+#include "../src/rubik/static_tables.h"
+
+typedef struct {
+    uint32_t key;
+    uint8_t value;
+} record_t;
+
+static const uint8_t inverse_move[MOVES] = {2, 1, 0, 5, 4, 3, 8, 7, 6};
+
+static uint32_t apply_move(uint32_t key, unsigned move)
+{
+    uint32_t p = key / ORIENTATIONS;
+    uint32_t o = key % ORIENTATIONS;
+    unsigned face = move / 3;
+    unsigned turns = move % 3 + 1;
+
+    do {
+        p = permutation[face][p];
+        o = orientation[face][o];
+    } while (--turns != 0);
+
+    return p * ORIENTATIONS + o;
+}
+
+static void write_u32_array(FILE *out,
+                            const char *name,
+                            const record_t *records,
+                            size_t count)
+{
+    fprintf(out, "static const uint32_t %s[%zu] = {\n", name, count);
+    for (size_t i = 0; i < count; i++) {
+        if (i % 6 == 0)
+            fputs("    ", out);
+        fprintf(out, "0x%08xu", records[i].key);
+        if (i + 1 != count)
+            fputc(',', out);
+        if (i % 6 == 5 || i + 1 == count)
+            fputc('\n', out);
+        else
+            fputc(' ', out);
+    }
+    fputs("};\n\n", out);
+}
+
+static void write_u8_array(FILE *out,
+                           const char *name,
+                           const record_t *records,
+                           size_t count)
+{
+    fprintf(out, "static const uint8_t %s[%zu] = {\n", name, count);
+    for (size_t i = 0; i < count; i++) {
+        if (i % 12 == 0)
+            fputs("    ", out);
+        fprintf(out, "0x%02xu", records[i].value);
+        if (i + 1 != count)
+            fputc(',', out);
+        if (i % 12 == 11 || i + 1 == count)
+            fputc('\n', out);
+        else
+            fputc(' ', out);
+    }
+    fputs("};\n\n", out);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s OUTPUT\n", argv[0]);
+        return 2;
+    }
+
+    uint8_t *distance = malloc(STATES);
+    uint8_t *toward_solved = malloc(STATES);
+    uint32_t *queue = malloc((size_t) STATES * sizeof(*queue));
+    record_t *near = malloc((size_t) NEAR_COUNT * sizeof(*near));
+    record_t *far = malloc((size_t) FAR_COUNT * sizeof(*far));
+    if (!distance || !toward_solved || !queue || !near || !far) {
+        fputs("allocation failed\n", stderr);
+        free(distance);
+        free(toward_solved);
+        free(queue);
+        free(near);
+        free(far);
+        return 1;
+    }
+
+    memset(distance, UINT8_MAX, STATES);
+    distance[0] = 0;
+    toward_solved[0] = 0;
+    queue[0] = 0;
+    size_t head = 0, tail = 1;
+
+    while (head < tail) {
+        uint32_t key = queue[head++];
+        uint8_t depth = distance[key];
+        if (depth == 11)
+            continue;
+
+        for (unsigned move = 0; move < MOVES; move++) {
+            uint32_t next = apply_move(key, move);
+            if (distance[next] != UINT8_MAX)
+                continue;
+            distance[next] = (uint8_t) (depth + 1);
+            toward_solved[next] = inverse_move[move];
+            queue[tail++] = next;
+        }
+    }
+
+    size_t near_count = 0, far_count = 0;
+    for (uint32_t key = 0; key < STATES; key++) {
+        if (distance[key] <= 5) {
+            if (near_count >= NEAR_COUNT) {
+                fputs("near table overflow\n", stderr);
+                free(distance);
+                free(toward_solved);
+                free(queue);
+                free(near);
+                free(far);
+                return 1;
+            }
+            near[near_count].key = key;
+            near[near_count].value =
+                (uint8_t) ((distance[key] << 4) | toward_solved[key]);
+            near_count++;
+        }
+        if (distance[key] == 11) {
+            if (far_count >= FAR_COUNT) {
+                fputs("distance-11 table overflow\n", stderr);
+                free(distance);
+                free(toward_solved);
+                free(queue);
+                free(near);
+                free(far);
+                return 1;
+            }
+            far[far_count].key = key;
+            far[far_count].value = toward_solved[key];
+            far_count++;
+        }
+    }
+
+    if (tail != STATES || near_count != NEAR_COUNT || far_count != FAR_COUNT) {
+        fprintf(stderr,
+                "unexpected graph: states=%zu near=%zu distance11=%zu\n", tail,
+                near_count, far_count);
+        free(distance);
+        free(toward_solved);
+        free(queue);
+        free(near);
+        free(far);
+        return 1;
+    }
+
+    FILE *out = fopen(argv[1], "w");
+    if (!out) {
+        perror(argv[1]);
+        free(distance);
+        free(toward_solved);
+        free(queue);
+        free(near);
+        free(far);
+        return 1;
+    }
+
+    fputs("/* Generated by tools/generate_rubik_lookup.c. */\n", out);
+    fputs("#pragma once\n\n", out);
+    fputs("// clang-format off\n", out);
+    fprintf(out, "#define RUBIK_NEAR_COUNT %zuu\n", near_count);
+    fprintf(out, "#define RUBIK_FAR_COUNT %zuu\n\n", far_count);
+    write_u32_array(out, "rubik_near_key", near, near_count);
+    write_u8_array(out, "rubik_near_info", near, near_count);
+    write_u32_array(out, "rubik_far_key", far, far_count);
+    write_u8_array(out, "rubik_far_move", far, far_count);
+    fputs("// clang-format on\n", out);
+
+    int failed = ferror(out);
+    if (fclose(out) != 0)
+        failed = 1;
+    free(distance);
+    free(toward_solved);
+    free(queue);
+    free(near);
+    free(far);
+    return failed;
+}

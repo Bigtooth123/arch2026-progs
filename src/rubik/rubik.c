@@ -9,7 +9,8 @@ enum {
     FACES = 3,
     MOVES = 9,
     MAX_SOLUTION_LENGTH = 11,
-    IDA_STACK_DEPTH = MAX_SOLUTION_LENGTH + 1
+    NEAR_DISTANCE = 5,
+    SEARCH_STACK_DEPTH = MAX_SOLUTION_LENGTH - NEAR_DISTANCE + 1
 };
 
 typedef struct {
@@ -27,19 +28,21 @@ typedef struct {
     uint16_t o;
     uint8_t next_move;
     uint8_t last_face;
-} ida_frame_t;
+} search_frame_t;
 
 
 /*
  * Generated in Assignment 1.
  *
- * Expected tables:
+ * Assignment 1 provides the quarter-turn transition tables:
  *
  * static const uint16_t permutation[3][5040];
  * static const uint16_t orientation[3][729];
- * static const uint8_t  perm_dist[5040];
- * static const uint8_t  ori_dist[729];
+ *
+ * tools/generate_rubik_lookup.c derives the sorted distance-5 and distance-11
+ * tables used by the meet-in-the-middle search.
  */
+#include "lookup_tables.h"
 #include "static_tables.h"
 
 
@@ -256,64 +259,111 @@ static search_state_t apply_search_move(search_state_t state, uint8_t move)
 
 
 /* ------------------------------------------------------------
- * Heuristic
+ * Compact lookup tables
  * ------------------------------------------------------------ */
 
-static uint8_t heuristic(search_state_t state)
+static uint32_t search_state_key(search_state_t state)
 {
-    uint8_t hp = perm_dist[state.p];
-    uint8_t ho = ori_dist[state.o];
+    uint32_t p = state.p;
 
-    /*
-     * Both are lower bounds of the real cube distance.
-     */
-    return hp > ho ? hp : ho;
+    /* p * 729 + o, without requiring a multiplication instruction. */
+    return (p << 10U) - (p << 8U) - (p << 5U) - (p << 3U) + p + state.o;
+}
+
+
+static int lookup_key(const uint32_t *keys, uint32_t count, uint32_t key)
+{
+    uint32_t low = 0;
+    uint32_t high = count;
+
+    while (low < high) {
+        uint32_t mid = low + ((high - low) >> 1U);
+        uint32_t value = keys[mid];
+
+        if (value < key)
+            low = mid + 1U;
+        else
+            high = mid;
+    }
+
+    if (low < count && keys[low] == key)
+        return (int) low;
+    return -1;
+}
+
+
+static int append_near_solution(search_state_t state,
+                                uint8_t *solution,
+                                uint8_t *solution_length)
+{
+    int index =
+        lookup_key(rubik_near_key, RUBIK_NEAR_COUNT, search_state_key(state));
+    if (index < 0)
+        return 0;
+
+    uint8_t info = rubik_near_info[index];
+    uint8_t distance = info >> 4U;
+
+    for (uint8_t i = 0; i < distance; ++i) {
+        uint8_t move = info & 0x0FU;
+        solution[i] = move;
+        state = apply_search_move(state, move);
+
+        if (i + 1U < distance) {
+            index = lookup_key(rubik_near_key, RUBIK_NEAR_COUNT,
+                               search_state_key(state));
+            if (index < 0)
+                return 0;
+            info = rubik_near_info[index];
+        }
+    }
+
+    *solution_length = distance;
+    return 1;
 }
 
 
 /* ------------------------------------------------------------
- * IDA*
+ * Meet-in-the-middle search
  * ------------------------------------------------------------ */
 
-static int ida_star(search_state_t start,
-                    uint8_t *solution,
-                    uint8_t *solution_length)
+static int search_to_near(search_state_t start,
+                          uint8_t previous_face,
+                          uint8_t *solution,
+                          uint8_t *solution_length)
 {
-    ida_frame_t stack[IDA_STACK_DEPTH];
-
-    uint8_t bound = heuristic(start);
-
-    /*
-     * Already solved.
-     */
-    if (start.p == 0 && start.o == 0) {
-        *solution_length = 0;
+    uint8_t suffix_length;
+    if (append_near_solution(start, solution, &suffix_length)) {
+        *solution_length = suffix_length;
         return 1;
     }
 
-    /*
-     * 2x2x2 HTM diameter is 11.
-     */
-    while (bound <= MAX_SOLUTION_LENGTH) {
-        uint8_t depth = 0;
-        uint8_t next_bound = UINT8_MAX;
+    search_frame_t stack[SEARCH_STACK_DEPTH];
 
-        ida_frame_t *frame = &stack[0];
+    for (uint8_t limit = 1; limit <= NEAR_DISTANCE; ++limit) {
+        uint8_t depth = 0;
+        search_frame_t *frame = &stack[0];
 
         frame->p = start.p;
         frame->o = start.o;
         frame->next_move = 0;
-
-        /*
-         * FACES (=3) means "no previous face".
-         */
-        frame->last_face = FACES;
+        frame->last_face = previous_face;
 
         for (;;) {
-            /*
-             * All moves at this node have been tried.
-             * Backtrack.
-             */
+            if (depth == limit) {
+                search_state_t leaf = {frame->p, frame->o};
+
+                if (append_near_solution(leaf, solution + depth,
+                                         &suffix_length)) {
+                    *solution_length = (uint8_t) (depth + suffix_length);
+                    return 1;
+                }
+
+                --depth;
+                --frame;
+                continue;
+            }
+
             if (frame->next_move == MOVES) {
                 if (depth == 0)
                     break;
@@ -327,71 +377,53 @@ static int ida_star(search_state_t start,
             uint8_t face = move_face[move];
 
             /*
-             * Same-face pruning.
-             *
-             * R followed by R/R2/R' can always be replaced by
-             * one move or cancelled.
+             * Consecutive turns of one face are never part of a shortest path.
              */
             if (face == frame->last_face)
                 continue;
 
-            search_state_t next;
-
-            next.p = frame->p;
-            next.o = frame->o;
-
+            search_state_t next = {frame->p, frame->o};
             next = apply_search_move(next, move);
-
-            uint8_t next_depth = (uint8_t) (depth + 1U);
-
             solution[depth] = move;
 
-            /*
-             * Goal test.
-             */
-            if (next.p == 0 && next.o == 0) {
-                *solution_length = next_depth;
-                return 1;
-            }
-
-            /*
-             * f(n) = g(n) + h(n)
-             */
-            uint8_t estimate = (uint8_t) (next_depth + heuristic(next));
-
-            /*
-             * Outside current IDA* bound.
-             */
-            if (estimate > bound) {
-                if (estimate < next_bound)
-                    next_bound = estimate;
-
-                continue;
-            }
-
-            /*
-             * Descend one level.
-             */
             ++frame;
-
             frame->p = next.p;
             frame->o = next.o;
             frame->next_move = 0;
             frame->last_face = face;
-
-            depth = next_depth;
+            ++depth;
         }
-
-        /*
-         * No deeper threshold exists.
-         */
-        if (next_bound == UINT8_MAX)
-            return 0;
-
-        bound = next_bound;
     }
 
     return 0;
+}
+
+
+static int solve_search(search_state_t start,
+                        uint8_t *solution,
+                        uint8_t *solution_length)
+{
+    uint8_t prefix_length = 0;
+    uint8_t previous_face = FACES;
+    int index =
+        lookup_key(rubik_far_key, RUBIK_FAR_COUNT, search_state_key(start));
+
+    /* Every distance-11 state stores one move toward distance 10. */
+    if (index >= 0) {
+        uint8_t move = rubik_far_move[index];
+        solution[0] = move;
+        start = apply_search_move(start, move);
+        prefix_length = 1;
+        previous_face = move_face[move];
+    }
+
+    uint8_t remaining_length;
+    if (!search_to_near(start, previous_face, solution + prefix_length,
+                        &remaining_length))
+        return 0;
+
+    *solution_length = (uint8_t) (prefix_length + remaining_length);
+    return 1;
 }
 
 
@@ -460,7 +492,7 @@ int rubik_solve(const char *input, char *out, size_t cap)
      * Every valid 2x2x2 state in this representation should be
      * solvable within 11 moves.
      */
-    if (!ida_star(start, solution, &solution_length))
+    if (!solve_search(start, solution, &solution_length))
         return -1;
 
     /*
